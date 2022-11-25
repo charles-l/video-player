@@ -34,6 +34,7 @@ pub fn build(b: *std.build.Builder) void {
     exe.linkSystemLibrary("avcodec");
     exe.linkSystemLibrary("avutil");
     exe.linkSystemLibrary("swscale");
+    exe.linkSystemLibrary("swresample");
     exe.linkLibC();
     exe.install();
 

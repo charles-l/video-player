@@ -1,8 +1,11 @@
 const std = @import("std");
+const print = std.debug.print;
 const c = @cImport({
     @cInclude("libavcodec/avcodec.h");
     @cInclude("libavformat/avformat.h");
     @cInclude("libavutil/imgutils.h");
+    @cInclude("libavutil/opt.h");
+    @cInclude("libswresample/swresample.h");
     @cInclude("libswscale/swscale.h");
 });
 
@@ -16,18 +19,46 @@ const audio_thread_buffer_size = max_audio_frame_size * 3 / 2;
 const max_packet_frames = 3840;
 
 var audio_codec_ctx: ?*c.AVCodecContext = null;
-var audio_batch_queue = std.atomic.Queue([max_packet_frames]u16).init();
+var audio_batch_queue = std.atomic.Queue(std.ArrayList(i16)).init();
+
+var sine_idx: f32 = 0;
 
 export fn audio_callback(buffer: ?*anyopaque, frames: u32) void {
-    var buf = @ptrCast([*]u16, @alignCast(@alignOf(u16), buffer))[0 .. frames * @intCast(u32, audio_codec_ctx.?.channels)];
+    var buf = @ptrCast([*]i16, @alignCast(@alignOf(i16), buffer))[0 .. frames * @intCast(u32, audio_codec_ctx.?.channels)];
+    var buf_filled: usize = 0;
 
-    @memset(@ptrCast([*]u8, buf), 0, buf.len * @sizeOf(u16));
-    if (audio_batch_queue.get()) |batch| {
-        std.mem.copy(u16, buf, batch.data[0..@min(buf.len, batch.data.len)]);
+    @memset(@ptrCast([*]u8, buf), 0, buf.len * @sizeOf(i16));
+    while (buf_filled < buf.len) {
+        if (audio_batch_queue.get()) |batch| {
+            if (batch.data.items.len < buf.len - buf_filled) {
+                std.mem.copy(i16, buf, batch.data.items);
+                buf_filled += batch.data.items.len;
+            } else {
+                std.mem.copy(i16, buf, batch.data.items[0 .. buf.len - buf_filled]);
+                var leftover = std.ArrayList(i16).init(batch.data.allocator);
+                leftover.appendSlice(batch.data.items[buf.len - buf_filled ..]) catch @panic("couldn't append");
+                audio_batch_queue.unget(&.{ .data = leftover });
+                break;
+            }
+        } else {
+            print("starved\n", .{});
+            break;
+        }
     }
+
+    //var i: usize = 0;
+    //while (i < buf.len) : (i += 2) {
+    //    buf[i] = @floatToInt(i16, 32000.0 * std.math.sin(2.0 * std.math.pi * sine_idx));
+    //    buf[i + 1] = buf[i];
+    //    sine_idx += 440.0 / 44100.0;
+    //    if (sine_idx > 1.0) sine_idx -= 1.0;
+    //}
 }
 
 pub fn main() !void {
+    var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
+    const gpa = general_purpose_allocator.allocator();
+
     rl.InitWindow(800, 600, "vid");
     defer rl.CloseWindow();
 
@@ -111,14 +142,12 @@ pub fn main() !void {
         return error.CouldNotAllocFrame;
     }
     defer c.av_frame_free(&frame);
-    defer c.av_free(@ptrCast(*anyopaque, frame));
 
     var frame_rgb = c.av_frame_alloc();
     if (frame_rgb == null) {
         return error.CouldNotAllocFrame;
     }
     defer c.av_frame_free(&frame_rgb);
-    defer c.av_free(@ptrCast(*anyopaque, frame_rgb));
 
     const num_bytes = @intCast(usize, c.av_image_get_buffer_size(c.AV_PIX_FMT_RGB24, codec_ctx.*.width, codec_ctx.*.height, 32));
     const buffer = @ptrCast([*]u8, c.av_malloc(num_bytes * @sizeOf(u8)))[0 .. num_bytes * @sizeOf(u8)];
@@ -153,6 +182,34 @@ pub fn main() !void {
         null,
         null,
     );
+
+    const swr_ctx = c.swr_alloc();
+    std.debug.assert(swr_ctx != null);
+
+    std.debug.assert(audio_codec_ctx.?.ch_layout.nb_channels == 2);
+    if (c.av_opt_set_int(swr_ctx, "in_channel_layout", c.AV_CH_LAYOUT_STEREO, 0) < 0) {
+        return error.FailedToSetOption;
+    }
+    if (c.av_opt_set_int(swr_ctx, "in_sample_rate", audio_codec_ctx.?.sample_rate, 0) < 0) {
+        return error.FailedToSetOption;
+    }
+    if (c.av_opt_set_sample_fmt(swr_ctx, "in_sample_fmt", audio_codec_ctx.?.sample_fmt, 0) < 0) {
+        return error.FailedToSetOption;
+    }
+
+    if (c.av_opt_set_int(swr_ctx, "out_channel_layout", c.AV_CH_LAYOUT_STEREO, 0) < 0) {
+        return error.FailedToSetOption;
+    }
+    if (c.av_opt_set_int(swr_ctx, "out_sample_rate", audio_codec_ctx.?.sample_rate, 0) < 0) {
+        return error.FailedToSetOption;
+    }
+    if (c.av_opt_set_sample_fmt(swr_ctx, "out_sample_fmt", c.AV_SAMPLE_FMT_S16, 0) < 0) {
+        return error.FailedToSetOption;
+    }
+
+    if (c.swr_init(swr_ctx) < 0) {
+        return error.FailedToInitResampling;
+    }
 
     var frame_i: u32 = 0;
     while (c.av_read_frame(format_ctx, packet) >= 0 and !rl.WindowShouldClose()) : (frame_i += 1) {
@@ -206,8 +263,7 @@ pub fn main() !void {
                 return error.ErrorDecodingPacket;
             }
 
-            var batch = [_]u16{0} ** max_packet_frames;
-            var batch_i: usize = 0;
+            var batch = std.ArrayList(i16).init(gpa);
             var i: u32 = 0;
             while (true) : (i += 1) {
                 const r = c.avcodec_receive_frame(audio_codec_ctx, frame);
@@ -216,18 +272,32 @@ pub fn main() !void {
                 } else if (r < 0) {
                     return error.ErrorDecodingPacket;
                 }
-                //std.mem.copy(
-                //    u16,
-                //    batch[batch_i..],
-                //    frame.*.data[0][0..@intCast(usize, frame.*.linesize[0])],
-                //);
-                batch_i += @intCast(usize, frame.*.linesize[0]);
+
+                const dest_samples = @intCast(i32, c.av_rescale_rnd(
+                    c.swr_get_delay(swr_ctx, audio_codec_ctx.?.sample_rate) + frame.*.nb_samples,
+                    audio_codec_ctx.?.sample_rate,
+                    audio_codec_ctx.?.sample_rate,
+                    c.AV_ROUND_UP,
+                ));
+
+                var dest_data: [*c][*c]u8 = undefined;
+                var dest_linesize: [2]i32 = [2]i32{ 0, 0 };
+                if (c.av_samples_alloc_array_and_samples(&dest_data, &dest_linesize[0], 2, dest_samples, c.AV_SAMPLE_FMT_S16, 0) < 0) {
+                    return error.AllocFailure;
+                }
+                //if (c.av_samples_alloc(dest_data, &dest_linesize, 2, dest_samples, c.AV_SAMPLE_FMT_S16, 0) < 0) {
+                //return error.AllocError;
+                //}
+                const rr = c.swr_convert(swr_ctx, dest_data, dest_samples, &frame.*.data[0], frame.*.nb_samples);
+                if (rr < 0) {
+                    return error.ConvertError;
+                }
+                const dest_bufsize = c.av_samples_get_buffer_size(&dest_linesize, 2, rr, c.AV_SAMPLE_FMT_S16, 1);
+
+                try batch.appendSlice(std.mem.bytesAsSlice(i16, @alignCast(2, dest_data[0][0..@intCast(usize, dest_bufsize)])));
             }
 
-            var node = @TypeOf(audio_batch_queue).Node{ .data = .{} };
-            @memset(@ptrCast([*]u8, &node.data), 0, node.data.len * @sizeOf(u16));
-            _ = batch;
-            audio_batch_queue.put(&node);
+            audio_batch_queue.put(&.{ .data = batch });
 
             c.av_packet_unref(packet);
         } else {
