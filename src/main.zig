@@ -14,32 +14,41 @@ const rl = @cImport({
 });
 
 const AV_EOF = std.mem.readPackedInt(u32, "EOF ", 0, .Little);
-const max_audio_frame_size = 192000;
-const audio_thread_buffer_size = max_audio_frame_size * 3 / 2;
-const max_packet_frames = 3840;
 
 var audio_codec_ctx: ?*c.AVCodecContext = null;
 var audio_batch_queue = std.atomic.Queue(std.ArrayList(i16)).init();
 
+var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+const gpa = general_purpose_allocator.allocator();
+
 var sine_idx: f32 = 0;
 
 export fn audio_callback(buffer: ?*anyopaque, frames: u32) void {
-    var buf = @ptrCast([*]i16, @alignCast(@alignOf(i16), buffer))[0 .. frames * @intCast(u32, audio_codec_ctx.?.channels)];
-    var buf_filled: usize = 0;
+    var buf = @ptrCast([*]i16, @alignCast(@alignOf(i16), buffer))[0 .. frames * 2];
+    var frames_filled: usize = 0;
 
     @memset(@ptrCast([*]u8, buf), 0, buf.len * @sizeOf(i16));
-    while (buf_filled < buf.len) {
+    while (frames_filled < buf.len) {
         if (audio_batch_queue.get()) |batch| {
-            if (batch.data.items.len < buf.len - buf_filled) {
-                std.mem.copy(i16, buf, batch.data.items);
-                buf_filled += batch.data.items.len;
+            if (frames_filled + batch.data.items.len < buf.len) {
+                std.mem.copy(i16, buf[frames_filled..], batch.data.items);
+                frames_filled += batch.data.items.len;
+                batch.data.deinit();
+                gpa.destroy(batch);
             } else {
-                std.mem.copy(i16, buf, batch.data.items[0 .. buf.len - buf_filled]);
-                var leftover = std.ArrayList(i16).init(batch.data.allocator);
-                leftover.appendSlice(batch.data.items[buf.len - buf_filled ..]) catch @panic("couldn't append");
-                audio_batch_queue.unget(&.{ .data = leftover });
-                break;
+                std.mem.copy(i16, buf[frames_filled..], batch.data.items[0 .. buf.len - frames_filled]);
+
+                var leftover = std.ArrayList(i16).init(gpa);
+                leftover.appendSlice(batch.data.items[buf.len - frames_filled ..]) catch @panic("couldn't append");
+
+                batch.data.deinit();
+
+                batch.data = leftover;
+                audio_batch_queue.unget(batch);
+
+                frames_filled += buf.len - frames_filled;
             }
+            //batch.data.deinit();
         } else {
             print("starved\n", .{});
             break;
@@ -56,16 +65,20 @@ export fn audio_callback(buffer: ?*anyopaque, frames: u32) void {
 }
 
 pub fn main() !void {
-    var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
-    const gpa = general_purpose_allocator.allocator();
+    defer std.debug.assert(!general_purpose_allocator.deinit());
+    defer {
+        // cleanup any leftover data in the queue
+        while (audio_batch_queue.get()) |n| {
+            n.data.deinit();
+            gpa.destroy(n);
+        }
+    }
 
     rl.InitWindow(800, 600, "vid");
     defer rl.CloseWindow();
 
     rl.InitAudioDevice();
     defer rl.CloseAudioDevice();
-
-    rl.SetAudioStreamBufferSizeDefault(3840 * 2);
 
     var format_ctx: ?*c.AVFormatContext = null;
     if (c.avformat_open_input(&format_ctx, "/home/nc/Downloads/Mice and cheese - Animation-kMYokm13GyM.mkv", null, null) < 0) {
@@ -100,12 +113,13 @@ pub fn main() !void {
         return error.FailedToParseCodec;
     }
     defer _ = c.avcodec_close(audio_codec_ctx);
+    defer c.avcodec_free_context(&audio_codec_ctx);
 
     if (c.avcodec_open2(audio_codec_ctx, audio_codec, null) < 0) {
         return error.CouldNotOpenCodec;
     }
 
-    var audio_stream = rl.LoadAudioStream(@intCast(u32, audio_codec_ctx.?.sample_rate), 16, @intCast(u32, audio_codec_ctx.?.channels));
+    var audio_stream = rl.LoadAudioStream(@intCast(u32, audio_codec_ctx.?.sample_rate), 16, 2);
     rl.SetAudioStreamCallback(audio_stream, audio_callback);
     rl.PlayAudioStream(audio_stream);
 
@@ -127,11 +141,12 @@ pub fn main() !void {
 
     // XXX: the notes said this should be copied from the original source, but
     // I guess this is using the source directly?
-    const codec_ctx = c.avcodec_alloc_context3(codec);
+    var codec_ctx = c.avcodec_alloc_context3(codec);
     if (c.avcodec_parameters_to_context(codec_ctx, format_ctx.?.streams[video_stream_i].*.codecpar) < 0) {
         return error.FailedToParseCodec;
     }
     defer _ = c.avcodec_close(codec_ctx);
+    defer c.avcodec_free_context(&codec_ctx);
 
     if (c.avcodec_open2(codec_ctx, codec, null) < 0) {
         return error.CouldNotOpenCodec;
@@ -165,10 +180,10 @@ pub fn main() !void {
         return error.FailedToImageFillArray;
     }
 
-    const packet = c.av_packet_alloc();
-    if (packet == null) {
-        return error.CouldNotAllocPacket;
-    }
+    var packet: c.AVPacket = undefined;
+    c.av_init_packet(&packet);
+    packet.data = null;
+    packet.size = 0;
 
     const sws_ctx = c.sws_getContext(
         codec_ctx.*.width,
@@ -182,8 +197,10 @@ pub fn main() !void {
         null,
         null,
     );
+    defer c.sws_freeContext(sws_ctx);
 
-    const swr_ctx = c.swr_alloc();
+    var swr_ctx = c.swr_alloc();
+    defer c.swr_free(&swr_ctx);
     std.debug.assert(swr_ctx != null);
 
     std.debug.assert(audio_codec_ctx.?.ch_layout.nb_channels == 2);
@@ -211,10 +228,17 @@ pub fn main() !void {
         return error.FailedToInitResampling;
     }
 
+    //const file = try std.fs.cwd().createFile(
+    //    "audio_data.bin",
+    //    .{ .read = true },
+    //);
+    //defer file.close();
+
     var frame_i: u32 = 0;
-    while (c.av_read_frame(format_ctx, packet) >= 0 and !rl.WindowShouldClose()) : (frame_i += 1) {
-        if (packet.*.stream_index == video_stream_i) {
-            if (c.avcodec_send_packet(codec_ctx, packet) < 0) {
+    // FIXME: this av_read_frame call still seems to be leaking a bit of memory somewhere...
+    while (c.av_read_frame(format_ctx, &packet) >= 0 and !rl.WindowShouldClose()) : (frame_i += 1) {
+        if (packet.stream_index == video_stream_i) {
+            if (c.avcodec_send_packet(codec_ctx, &packet) < 0) {
                 return error.ErrorDecodingPacket;
             }
 
@@ -241,7 +265,7 @@ pub fn main() !void {
                 }
 
                 const fps = c.av_q2d(format_ctx.?.streams[video_stream_i].*.r_frame_rate);
-                rl.WaitTime(1.0 / fps);
+                rl.WaitTime(1.0 / fps * 0.9);
 
                 const img = rl.Image{
                     .data = @ptrCast(*anyopaque, frame_rgb.*.data[0]),
@@ -257,9 +281,8 @@ pub fn main() !void {
 
                 rl.EndDrawing();
             }
-            c.av_packet_unref(packet);
-        } else if (packet.*.stream_index == audio_stream_i) {
-            if (c.avcodec_send_packet(audio_codec_ctx, packet) < 0) {
+        } else if (packet.stream_index == audio_stream_i) {
+            if (c.avcodec_send_packet(audio_codec_ctx, &packet) < 0) {
                 return error.ErrorDecodingPacket;
             }
 
@@ -293,15 +316,27 @@ pub fn main() !void {
                     return error.ConvertError;
                 }
                 const dest_bufsize = c.av_samples_get_buffer_size(&dest_linesize, 2, rr, c.AV_SAMPLE_FMT_S16, 1);
+                var dest = std.mem.bytesAsSlice(i16, @alignCast(2, dest_data[0][0..@intCast(usize, dest_bufsize)]));
 
-                try batch.appendSlice(std.mem.bytesAsSlice(i16, @alignCast(2, dest_data[0][0..@intCast(usize, dest_bufsize)])));
+                //for (dest) |*d| {
+                //    d.* = @floatToInt(i16, 32000.0 * std.math.sin(2.0 * std.math.pi * sine_idx));
+                //    //dest[i + 1] = dest[i];
+                //    sine_idx += 440.0 / 44100.0;
+                //    if (sine_idx > 1.0) sine_idx -= 1.0;
+                //}
+
+                try batch.appendSlice(dest);
+
+                //_ = try file.write(std.mem.sliceAsBytes(dest));
+
+                c.av_freep(@ptrCast(*anyopaque, &dest_data[0]));
+                c.av_freep(@ptrCast(*anyopaque, &dest_data));
             }
 
-            audio_batch_queue.put(&.{ .data = batch });
-
-            c.av_packet_unref(packet);
-        } else {
-            c.av_packet_unref(packet);
+            var n = try gpa.create(@TypeOf(audio_batch_queue).Node);
+            n.data = batch;
+            audio_batch_queue.put(n);
         }
+        c.av_packet_unref(&packet);
     }
 }
