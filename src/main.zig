@@ -48,20 +48,32 @@ export fn audio_callback(buffer: ?*anyopaque, frames: u32) void {
 
                 frames_filled += buf.len - frames_filled;
             }
-            //batch.data.deinit();
         } else {
             print("starved\n", .{});
             break;
         }
     }
+}
 
-    //var i: usize = 0;
-    //while (i < buf.len) : (i += 2) {
-    //    buf[i] = @floatToInt(i16, 32000.0 * std.math.sin(2.0 * std.math.pi * sine_idx));
-    //    buf[i + 1] = buf[i];
-    //    sine_idx += 440.0 / 44100.0;
-    //    if (sine_idx > 1.0) sine_idx -= 1.0;
-    //}
+fn assertNotNull(x: anytype) @TypeOf(x) {
+    if (x == null) {
+        @panic("expected to be not null");
+    }
+    return x;
+}
+
+// check for an error in ffmpeg return value
+fn check(x: anytype, e: anyerror) !@TypeOf(x) {
+    if (@TypeOf(x) == c_int) {
+        if (x < 0) {
+            return e;
+        }
+    } else {
+        if (x == null) {
+            return e;
+        }
+    }
+    return x;
 }
 
 pub fn main() !void {
@@ -81,14 +93,10 @@ pub fn main() !void {
     defer rl.CloseAudioDevice();
 
     var format_ctx: ?*c.AVFormatContext = null;
-    if (c.avformat_open_input(&format_ctx, "/home/nc/Downloads/Mice and cheese - Animation-kMYokm13GyM.mkv", null, null) < 0) {
-        return error.CouldNotOpenFile;
-    }
+    _ = try check(c.avformat_open_input(&format_ctx, "/home/nc/Downloads/Mice and cheese - Animation-kMYokm13GyM.mkv", null, null), error.OpeningFile);
     defer c.avformat_close_input(&format_ctx);
 
-    if (c.avformat_find_stream_info(format_ctx, null) < 0) {
-        return error.CouldNotFindStreamInfo;
-    }
+    _ = try check(c.avformat_find_stream_info(format_ctx, null), error.FindingStream);
 
     c.av_dump_format(format_ctx, 0, "anim.mkv", 0);
 
@@ -103,21 +111,15 @@ pub fn main() !void {
         return error.FailedToFindAudioStream;
     };
 
-    var audio_codec = c.avcodec_find_decoder(format_ctx.?.streams[audio_stream_i].*.codecpar.*.codec_id);
-    if (audio_codec == null) {
-        return error.CouldNotFindCodec;
-    }
+    var audio_codec = try check(c.avcodec_find_decoder(format_ctx.?.streams[audio_stream_i].*.codecpar.*.codec_id), error.FindingCodec);
 
     audio_codec_ctx = c.avcodec_alloc_context3(audio_codec);
-    if (c.avcodec_parameters_to_context(audio_codec_ctx, format_ctx.?.streams[audio_stream_i].*.codecpar) < 0) {
-        return error.FailedToParseCodec;
-    }
+    _ = try check(c.avcodec_parameters_to_context(audio_codec_ctx, format_ctx.?.streams[audio_stream_i].*.codecpar), error.CodecSetup);
+
     defer _ = c.avcodec_close(audio_codec_ctx);
     defer c.avcodec_free_context(&audio_codec_ctx);
 
-    if (c.avcodec_open2(audio_codec_ctx, audio_codec, null) < 0) {
-        return error.CouldNotOpenCodec;
-    }
+    _ = try check(c.avcodec_open2(audio_codec_ctx, audio_codec, null), error.OpeningCodec);
 
     var audio_stream = rl.LoadAudioStream(@intCast(u32, audio_codec_ctx.?.sample_rate), 16, 2);
     rl.SetAudioStreamCallback(audio_stream, audio_callback);
@@ -134,51 +136,37 @@ pub fn main() !void {
         return error.FailedToFindVideoStream;
     };
 
-    var codec = c.avcodec_find_decoder(format_ctx.?.streams[video_stream_i].*.codecpar.*.codec_id);
-    if (codec == null) {
-        return error.CouldNotFindCodec;
-    }
+    var codec = try check(c.avcodec_find_decoder(format_ctx.?.streams[video_stream_i].*.codecpar.*.codec_id), error.FindingCodec);
 
     // XXX: the notes said this should be copied from the original source, but
     // I guess this is using the source directly?
     var codec_ctx = c.avcodec_alloc_context3(codec);
-    if (c.avcodec_parameters_to_context(codec_ctx, format_ctx.?.streams[video_stream_i].*.codecpar) < 0) {
-        return error.FailedToParseCodec;
-    }
+    _ = try check(c.avcodec_parameters_to_context(codec_ctx, format_ctx.?.streams[video_stream_i].*.codecpar), error.CodecSetup);
+
     defer _ = c.avcodec_close(codec_ctx);
     defer c.avcodec_free_context(&codec_ctx);
 
-    if (c.avcodec_open2(codec_ctx, codec, null) < 0) {
-        return error.CouldNotOpenCodec;
-    }
+    _ = try check(c.avcodec_open2(codec_ctx, codec, null), error.OpeningCodec);
 
-    var frame = c.av_frame_alloc();
-    if (frame == null) {
-        return error.CouldNotAllocFrame;
-    }
+    var frame = try check(c.av_frame_alloc(), error.AllocFailure);
     defer c.av_frame_free(&frame);
 
-    var frame_rgb = c.av_frame_alloc();
-    if (frame_rgb == null) {
-        return error.CouldNotAllocFrame;
-    }
+    var frame_rgb = try check(c.av_frame_alloc(), error.AllocFailure);
     defer c.av_frame_free(&frame_rgb);
 
     const num_bytes = @intCast(usize, c.av_image_get_buffer_size(c.AV_PIX_FMT_RGB24, codec_ctx.*.width, codec_ctx.*.height, 32));
-    const buffer = @ptrCast([*]u8, c.av_malloc(num_bytes * @sizeOf(u8)))[0 .. num_bytes * @sizeOf(u8)];
-    defer c.av_free(@ptrCast(*anyopaque, buffer));
+    const buffer = try gpa.alloc(u8, num_bytes);
+    defer gpa.free(buffer);
 
-    if (c.av_image_fill_arrays(
+    _ = try check(c.av_image_fill_arrays(
         &frame_rgb.*.data,
         &frame_rgb.*.linesize,
-        @ptrCast([*c]const u8, buffer),
+        &buffer[0],
         c.AV_PIX_FMT_RGB24,
         codec_ctx.*.width,
         codec_ctx.*.height,
         32,
-    ) < 0) {
-        return error.FailedToImageFillArray;
-    }
+    ), error.FailedToImageFillArray);
 
     var packet: c.AVPacket = undefined;
     c.av_init_packet(&packet);
@@ -199,40 +187,18 @@ pub fn main() !void {
     );
     defer c.sws_freeContext(sws_ctx);
 
-    var swr_ctx = c.swr_alloc();
+    var swr_ctx = try check(c.swr_alloc(), error.AllocFailure);
     defer c.swr_free(&swr_ctx);
-    std.debug.assert(swr_ctx != null);
 
-    std.debug.assert(audio_codec_ctx.?.ch_layout.nb_channels == 2);
-    if (c.av_opt_set_int(swr_ctx, "in_channel_layout", c.AV_CH_LAYOUT_STEREO, 0) < 0) {
-        return error.FailedToSetOption;
-    }
-    if (c.av_opt_set_int(swr_ctx, "in_sample_rate", audio_codec_ctx.?.sample_rate, 0) < 0) {
-        return error.FailedToSetOption;
-    }
-    if (c.av_opt_set_sample_fmt(swr_ctx, "in_sample_fmt", audio_codec_ctx.?.sample_fmt, 0) < 0) {
-        return error.FailedToSetOption;
-    }
+    _ = try check(c.av_opt_set_chlayout(swr_ctx, "in_chlayout", &audio_codec_ctx.?.ch_layout, 0), error.FailedToSetOption);
+    _ = try check(c.av_opt_set_int(swr_ctx, "in_sample_rate", audio_codec_ctx.?.sample_rate, 0), error.FailedToSetOption);
+    _ = try check(c.av_opt_set_sample_fmt(swr_ctx, "in_sample_fmt", audio_codec_ctx.?.sample_fmt, 0), error.FailedToSetOption);
 
-    if (c.av_opt_set_int(swr_ctx, "out_channel_layout", c.AV_CH_LAYOUT_STEREO, 0) < 0) {
-        return error.FailedToSetOption;
-    }
-    if (c.av_opt_set_int(swr_ctx, "out_sample_rate", audio_codec_ctx.?.sample_rate, 0) < 0) {
-        return error.FailedToSetOption;
-    }
-    if (c.av_opt_set_sample_fmt(swr_ctx, "out_sample_fmt", c.AV_SAMPLE_FMT_S16, 0) < 0) {
-        return error.FailedToSetOption;
-    }
+    _ = try check(c.av_opt_set_int(swr_ctx, "out_channel_layout", c.AV_CH_LAYOUT_STEREO, 0), error.FailedToSetOption);
+    _ = try check(c.av_opt_set_int(swr_ctx, "out_sample_rate", audio_codec_ctx.?.sample_rate, 0), error.FailedToSetOption);
+    _ = try check(c.av_opt_set_sample_fmt(swr_ctx, "out_sample_fmt", c.AV_SAMPLE_FMT_S16, 0), error.FailedToSetOption);
 
-    if (c.swr_init(swr_ctx) < 0) {
-        return error.FailedToInitResampling;
-    }
-
-    //const file = try std.fs.cwd().createFile(
-    //    "audio_data.bin",
-    //    .{ .read = true },
-    //);
-    //defer file.close();
+    _ = try check(c.swr_init(swr_ctx), error.FailedToInit);
 
     const img = rl.Image{
         .data = null,
@@ -249,9 +215,7 @@ pub fn main() !void {
     // FIXME: this av_read_frame call still seems to be leaking a bit of memory somewhere...
     while (c.av_read_frame(format_ctx, &packet) >= 0 and !rl.WindowShouldClose()) : (frame_i += 1) {
         if (packet.stream_index == video_stream_i) {
-            if (c.avcodec_send_packet(codec_ctx, &packet) < 0) {
-                return error.ErrorDecodingPacket;
-            }
+            _ = try check(c.avcodec_send_packet(codec_ctx, &packet), error.DecodingPacket);
 
             while (true) {
                 rl.BeginDrawing();
@@ -263,7 +227,7 @@ pub fn main() !void {
                     return error.ErrorDecodingPacket;
                 }
 
-                if (c.sws_scale(
+                _ = try check(c.sws_scale(
                     sws_ctx,
                     &frame.*.data,
                     &frame.*.linesize,
@@ -271,9 +235,7 @@ pub fn main() !void {
                     codec_ctx.*.height,
                     &frame_rgb.*.data,
                     &frame_rgb.*.linesize,
-                ) < 0) {
-                    return error.FailedToRescale;
-                }
+                ), error.FailedToRescale);
 
                 const fps = c.av_q2d(format_ctx.?.streams[video_stream_i].*.r_frame_rate);
                 rl.WaitTime(1.0 / fps * 0.9);
@@ -284,9 +246,7 @@ pub fn main() !void {
                 rl.EndDrawing();
             }
         } else if (packet.stream_index == audio_stream_i) {
-            if (c.avcodec_send_packet(audio_codec_ctx, &packet) < 0) {
-                return error.ErrorDecodingPacket;
-            }
+            _ = try check(c.avcodec_send_packet(audio_codec_ctx, &packet), error.ErrorDecodingPacket);
 
             var batch = std.ArrayList(i16).init(gpa);
             var i: u32 = 0;
@@ -305,31 +265,17 @@ pub fn main() !void {
                     c.AV_ROUND_UP,
                 ));
 
+                const dest_channels = 2;
+                const dest_format = c.AV_SAMPLE_FMT_S16;
                 var dest_data: [*c][*c]u8 = undefined;
-                var dest_linesize: [2]i32 = [2]i32{ 0, 0 };
-                if (c.av_samples_alloc_array_and_samples(&dest_data, &dest_linesize[0], 2, dest_samples, c.AV_SAMPLE_FMT_S16, 0) < 0) {
-                    return error.AllocFailure;
-                }
-                //if (c.av_samples_alloc(dest_data, &dest_linesize, 2, dest_samples, c.AV_SAMPLE_FMT_S16, 0) < 0) {
-                //return error.AllocError;
-                //}
-                const rr = c.swr_convert(swr_ctx, dest_data, dest_samples, &frame.*.data[0], frame.*.nb_samples);
-                if (rr < 0) {
-                    return error.ConvertError;
-                }
-                const dest_bufsize = c.av_samples_get_buffer_size(&dest_linesize, 2, rr, c.AV_SAMPLE_FMT_S16, 1);
-                var dest = std.mem.bytesAsSlice(i16, @alignCast(2, dest_data[0][0..@intCast(usize, dest_bufsize)]));
+                var dest_linesize: [dest_channels]i32 = [_]i32{ 0, 0 };
+                _ = try check(c.av_samples_alloc_array_and_samples(&dest_data, &dest_linesize[0], dest_channels, dest_samples, dest_format, 0), error.AllocFailure);
 
-                //for (dest) |*d| {
-                //    d.* = @floatToInt(i16, 32000.0 * std.math.sin(2.0 * std.math.pi * sine_idx));
-                //    //dest[i + 1] = dest[i];
-                //    sine_idx += 440.0 / 44100.0;
-                //    if (sine_idx > 1.0) sine_idx -= 1.0;
-                //}
+                const rr = try check(c.swr_convert(swr_ctx, dest_data, dest_samples, &frame.*.data[0], frame.*.nb_samples), error.ConvertError);
+                const dest_bufsize = c.av_samples_get_buffer_size(&dest_linesize, dest_channels, rr, dest_format, 1);
+                var dest = std.mem.bytesAsSlice(i16, @alignCast(@alignOf(i16), dest_data[0][0..@intCast(usize, dest_bufsize)]));
 
                 try batch.appendSlice(dest);
-
-                //_ = try file.write(std.mem.sliceAsBytes(dest));
 
                 c.av_freep(@ptrCast(*anyopaque, &dest_data[0]));
                 c.av_freep(@ptrCast(*anyopaque, &dest_data));
