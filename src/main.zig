@@ -234,6 +234,17 @@ pub fn main() !void {
     //);
     //defer file.close();
 
+    const img = rl.Image{
+        .data = null,
+        .width = codec_ctx.*.width,
+        .height = codec_ctx.*.height,
+        .format = rl.PIXELFORMAT_UNCOMPRESSED_R8G8B8,
+        .mipmaps = 1,
+    };
+
+    const tex = rl.LoadTextureFromImage(img);
+    defer rl.UnloadTexture(tex);
+
     var frame_i: u32 = 0;
     // FIXME: this av_read_frame call still seems to be leaking a bit of memory somewhere...
     while (c.av_read_frame(format_ctx, &packet) >= 0 and !rl.WindowShouldClose()) : (frame_i += 1) {
@@ -267,16 +278,7 @@ pub fn main() !void {
                 const fps = c.av_q2d(format_ctx.?.streams[video_stream_i].*.r_frame_rate);
                 rl.WaitTime(1.0 / fps * 0.9);
 
-                const img = rl.Image{
-                    .data = @ptrCast(*anyopaque, frame_rgb.*.data[0]),
-                    .width = codec_ctx.*.width,
-                    .height = codec_ctx.*.height,
-                    .format = rl.PIXELFORMAT_UNCOMPRESSED_R8G8B8,
-                    .mipmaps = 1,
-                };
-
-                const tex = rl.LoadTextureFromImage(img);
-                defer rl.UnloadTexture(tex);
+                rl.UpdateTexture(tex, @ptrCast(*anyopaque, frame_rgb.*.data[0]));
                 rl.DrawTexture(tex, 0, 0, rl.WHITE);
 
                 rl.EndDrawing();
