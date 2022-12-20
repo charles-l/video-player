@@ -13,10 +13,15 @@ const rl = @cImport({
     @cInclude("raylib.h");
 });
 
+const AudioBatch = struct {
+    buf: std.ArrayList(i16),
+    pts: i64,
+};
+
 const AV_EOF = std.mem.readPackedInt(u32, "EOF ", 0, .Little);
 
 var audio_codec_ctx: ?*c.AVCodecContext = null;
-var audio_batch_queue = std.atomic.Queue(std.ArrayList(i16)).init();
+var audio_batch_queue = std.atomic.Queue(AudioBatch).init();
 
 var audio_packet_queue = std.atomic.Queue(*c.AVPacket).init();
 var video_packet_queue = std.atomic.Queue(*c.AVPacket).init();
@@ -40,27 +45,28 @@ fn decodeFrame(ctx: *c.AVCodecContext, frame: *c.AVFrame) !bool {
     }
 }
 
-export fn audio_callback(buffer: ?*anyopaque, frames: u32) void {
+export fn audioCallback(buffer: ?*anyopaque, frames: u32) void {
     var buf = @ptrCast([*]i16, @alignCast(@alignOf(i16), buffer))[0 .. frames * 2];
     var frames_filled: usize = 0;
 
     @memset(@ptrCast([*]u8, buf), 0, buf.len * @sizeOf(i16));
     while (frames_filled < buf.len) {
         if (audio_batch_queue.get()) |batch| {
-            if (frames_filled + batch.data.items.len < buf.len) {
-                std.mem.copy(i16, buf[frames_filled..], batch.data.items);
-                frames_filled += batch.data.items.len;
-                batch.data.deinit();
+            audio_clock = batch.*.data.pts;
+            if (frames_filled + batch.data.buf.items.len < buf.len) {
+                std.mem.copy(i16, buf[frames_filled..], batch.data.buf.items);
+                frames_filled += batch.data.buf.items.len;
+                batch.data.buf.deinit();
                 gpa.destroy(batch);
             } else {
-                std.mem.copy(i16, buf[frames_filled..], batch.data.items[0 .. buf.len - frames_filled]);
+                std.mem.copy(i16, buf[frames_filled..], batch.data.buf.items[0 .. buf.len - frames_filled]);
 
                 var leftover = std.ArrayList(i16).init(gpa);
-                leftover.appendSlice(batch.data.items[buf.len - frames_filled ..]) catch @panic("couldn't append");
+                leftover.appendSlice(batch.data.buf.items[buf.len - frames_filled ..]) catch @panic("couldn't append");
 
-                batch.data.deinit();
+                batch.data.buf.deinit();
 
-                batch.data = leftover;
+                batch.data.buf = leftover;
                 audio_batch_queue.unget(batch);
 
                 frames_filled += buf.len - frames_filled;
@@ -130,6 +136,8 @@ var frame_rgb: ?*c.AVFrame = null;
 var frame_updated = false;
 var frame_lock = std.Thread.Mutex{};
 
+var audio_clock: i64 = 0;
+
 fn videoThread(video_codec_ctx: *c.AVCodecContext) !void {
     var frame = try check(c.av_frame_alloc(), error.AllocFailure);
     defer c.av_frame_free(&frame);
@@ -196,6 +204,10 @@ fn videoThread(video_codec_ctx: *c.AVCodecContext) !void {
                 &frame_rgb.?.*.linesize,
             ), error.FailedToRescale);
 
+            while (audio_clock < frame.*.pts) {
+                std.time.sleep(1_000);
+            }
+
             {
                 frame_lock.lock();
                 frame_updated = true;
@@ -236,6 +248,7 @@ fn audioThread() !void {
         var packet = qpacket.?.data;
 
         var batch = std.ArrayList(i16).init(gpa);
+        var pts: i64 = 0;
 
         _ = try check(c.avcodec_send_packet(audio_codec_ctx, packet), error.ErrorDecodingPacket);
         while (true) {
@@ -260,6 +273,7 @@ fn audioThread() !void {
             _ = try check(c.av_samples_alloc_array_and_samples(&dest_data, &dest_linesize[0], dest_channels, dest_samples, dest_format, 0), error.AllocFailure);
 
             const rr = try check(c.swr_convert(swr_ctx, dest_data, dest_samples, &frame.*.data[0], frame.*.nb_samples), error.ConvertError);
+            pts = frame.*.pts;
             const dest_bufsize = c.av_samples_get_buffer_size(&dest_linesize, dest_channels, rr, dest_format, 1);
             var dest = std.mem.bytesAsSlice(i16, @alignCast(@alignOf(i16), dest_data[0][0..@intCast(usize, dest_bufsize)]));
 
@@ -271,7 +285,7 @@ fn audioThread() !void {
         }
 
         var n = try gpa.create(@TypeOf(audio_batch_queue).Node);
-        n.data = batch;
+        n.data = AudioBatch{ .buf = batch, .pts = pts };
         audio_batch_queue.put(n);
     }
 }
@@ -282,7 +296,7 @@ pub fn main() !void {
     defer {
         // cleanup any leftover data in the queue
         while (audio_batch_queue.get()) |n| {
-            n.data.deinit();
+            n.data.buf.deinit();
             gpa.destroy(n);
         }
     }
@@ -323,7 +337,7 @@ pub fn main() !void {
     _ = try check(c.avcodec_open2(audio_codec_ctx, audio_codec, null), error.OpeningCodec);
 
     var audio_stream = rl.LoadAudioStream(@intCast(u32, audio_codec_ctx.?.sample_rate), 16, 2);
-    rl.SetAudioStreamCallback(audio_stream, audio_callback);
+    rl.SetAudioStreamCallback(audio_stream, audioCallback);
     rl.PlayAudioStream(audio_stream);
 
     //// video codec setup ////
