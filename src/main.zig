@@ -290,6 +290,9 @@ fn audioThread() !void {
     }
 }
 
+const windowWidth = 800;
+const windowHeight = 600;
+
 pub fn main() !void {
     // FIXME: enable again and fix mem leaks
     //defer std.debug.assert(!general_purpose_allocator.deinit());
@@ -301,14 +304,15 @@ pub fn main() !void {
         }
     }
 
-    rl.InitWindow(800, 600, "vid");
+    rl.InitWindow(windowWidth, windowHeight, "vid");
     defer rl.CloseWindow();
 
     rl.InitAudioDevice();
     defer rl.CloseAudioDevice();
 
     var format_ctx: ?*c.AVFormatContext = null;
-    _ = try check(c.avformat_open_input(&format_ctx, "/home/nc/Downloads/Mice and cheese - Animation-kMYokm13GyM.mkv", null, null), error.OpeningFile);
+    //_ = try check(c.avformat_open_input(&format_ctx, "/home/nc/Downloads/Mice and cheese - Animation-kMYokm13GyM.mkv", null, null), error.OpeningFile);
+    _ = try check(c.avformat_open_input(&format_ctx, "/home/nc/Downloads/5 Minutes of Battlefield 1 Domination Gameplay - 1080p, 60fps-5YdTrNmA7sQ.mkv", null, null), error.OpeningFile);
     defer c.avformat_close_input(&format_ctx);
 
     _ = try check(c.avformat_find_stream_info(format_ctx, null), error.FindingStream);
@@ -402,7 +406,15 @@ pub fn main() !void {
             frame_lock.unlock();
         }
 
-        rl.DrawTexture(tex, 0, 0, rl.WHITE);
+        const targetHeight = (windowWidth / @intToFloat(f32, video_codec_ctx.*.width)) * @intToFloat(f32, video_codec_ctx.*.height);
+        rl.DrawTexturePro(
+            tex,
+            rl.Rectangle{ .x = 0, .y = 0, .width = @intToFloat(f32, video_codec_ctx.*.width), .height = @intToFloat(f32, video_codec_ctx.*.height) },
+            rl.Rectangle{ .x = 0, .y = (windowHeight - targetHeight) / 2, .width = windowWidth, .height = targetHeight },
+            rl.Vector2{ .x = 0, .y = 0 },
+            0,
+            rl.WHITE,
+        );
         rl.EndDrawing();
     }
 }
