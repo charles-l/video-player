@@ -27,10 +27,21 @@ var audio_packet_queue = std.atomic.Queue(*c.AVPacket).init();
 var video_packet_queue = std.atomic.Queue(*c.AVPacket).init();
 const QueueNode = std.atomic.Queue(*c.AVPacket).Node;
 
+var flush_packet: c.AVPacket = undefined;
+
 var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
 const gpa = general_purpose_allocator.allocator();
 
-var sine_idx: f32 = 0;
+fn clearQueue(comptime T: type, queue: *std.atomic.Queue(T)) void {
+    while (queue.get()) |x| {
+        if (T == *c.AVPacket) {
+            c.av_packet_free(@ptrCast([*c][*c]c.AVPacket, &x.data));
+        } else if (T == AudioBatch) {
+            x.data.buf.deinit();
+        }
+        gpa.destroy(x);
+    }
+}
 
 /// Returns true when a new packet is needed
 fn decodeFrame(ctx: *c.AVCodecContext, frame: *c.AVFrame) !bool {
@@ -113,26 +124,63 @@ fn readThread(ctx: *PlayerContext) !void {
     var packet = c.av_packet_alloc();
     defer c.av_packet_free(&packet);
 
-    var packet_i: u32 = 0;
-    // FIXME: this av_read_frame call still seems to be leaking a bit of memory somewhere...
-    while (c.av_read_frame(ctx.format_ctx, packet) >= 0) : (packet_i += 1) {
-        var packet1 = c.av_packet_alloc();
-        errdefer c.av_packet_free(&packet1);
+    while (!quit) {
+        var packet_i: u32 = 0;
 
-        c.av_packet_move_ref(packet1, packet);
+        if (seek) |t| {
+            const seek_target_video = c.av_rescale_q(t, c.AV_TIME_BASE_Q, ctx.format_ctx.streams[ctx.video_stream_i].*.time_base);
+            const seek_target_audio = c.av_rescale_q(t, c.AV_TIME_BASE_Q, ctx.format_ctx.streams[ctx.audio_stream_i].*.time_base);
+            var flags: i32 = 0;
+            if (@intToFloat(f32, t) < getMasterClock()) {
+                print("seek backwards\n", .{});
+                flags = c.AVSEEK_FLAG_BACKWARD;
+            }
+            print("{} {}\n", .{
+                t,
+                seek_target_video,
+            });
+            _ = try check(c.av_seek_frame(ctx.format_ctx, @intCast(i32, ctx.audio_stream_i), seek_target_audio, flags), error.SeekAudioError);
+            _ = try check(c.av_seek_frame(ctx.format_ctx, @intCast(i32, ctx.video_stream_i), seek_target_video, flags), error.SeekVideoError);
 
-        var qpacket = try gpa.create(QueueNode);
-        qpacket.data = packet1;
+            clearQueue(*c.AVPacket, &video_packet_queue);
+            clearQueue(*c.AVPacket, &audio_packet_queue);
+            clearQueue(AudioBatch, &audio_batch_queue);
 
-        if (packet1.*.stream_index == ctx.video_stream_i) {
-            video_packet_queue.put(qpacket);
-        } else if (packet1.*.stream_index == ctx.audio_stream_i) {
-            audio_packet_queue.put(qpacket);
-        } else {
-            print("drop packet\n", .{});
-            gpa.destroy(qpacket);
+            {
+                var qpacket = try gpa.create(QueueNode);
+                qpacket.data = &flush_packet;
+                video_packet_queue.put(qpacket);
+            }
+
+            {
+                var qpacket = try gpa.create(QueueNode);
+                qpacket.data = &flush_packet;
+                audio_packet_queue.put(qpacket);
+            }
+            seek = null;
         }
-        c.av_packet_unref(packet);
+        // FIXME: this av_read_frame call still seems to be leaking a bit of memory somewhere...
+        while (c.av_read_frame(ctx.format_ctx, packet) >= 0) : (packet_i += 1) {
+            var packet1 = c.av_packet_alloc();
+            errdefer c.av_packet_free(&packet1);
+
+            c.av_packet_move_ref(packet1, packet);
+
+            var qpacket = try gpa.create(QueueNode);
+            qpacket.data = packet1;
+
+            if (packet1.*.stream_index == ctx.video_stream_i) {
+                video_packet_queue.put(qpacket);
+            } else if (packet1.*.stream_index == ctx.audio_stream_i) {
+                audio_packet_queue.put(qpacket);
+            } else {
+                print("drop packet\n", .{});
+                gpa.destroy(qpacket);
+            }
+            c.av_packet_unref(packet);
+        }
+
+        std.time.sleep(1_000);
     }
 }
 
@@ -188,6 +236,12 @@ fn videoThread(video_codec_ctx: *c.AVCodecContext) !void {
         defer gpa.destroy(qpacket.?);
         var packet = qpacket.?.data;
 
+        if (packet == &flush_packet) {
+            print("flush video\n", .{});
+            c.avcodec_flush_buffers(video_codec_ctx);
+            continue;
+        }
+
         _ = try check(c.avcodec_send_packet(video_codec_ctx, packet), error.DecodingPacket);
 
         while (true) {
@@ -209,7 +263,7 @@ fn videoThread(video_codec_ctx: *c.AVCodecContext) !void {
             ), error.FailedToRescale);
 
             while (audio_clock < frame.*.pts) {
-                std.time.sleep(1_000);
+                std.atomic.spinLoopHint();
             }
 
             {
@@ -250,6 +304,12 @@ fn audioThread() !void {
         defer gpa.destroy(qpacket.?);
 
         var packet = qpacket.?.data;
+
+        if (packet == &flush_packet) {
+            print("flush audio\n", .{});
+            c.avcodec_flush_buffers(audio_codec_ctx);
+            continue;
+        }
 
         var batch = std.ArrayList(i16).init(gpa);
         var pts: i64 = 0;
@@ -297,17 +357,15 @@ fn audioThread() !void {
 const windowWidth = 800;
 const windowHeight = 600;
 var quit = false;
+// FIXME: not threadsafe I don't think...
+var seek: ?i64 = null;
 
 pub fn main() !void {
-    // FIXME: enable again and fix mem leaks
-    //defer std.debug.assert(!general_purpose_allocator.deinit());
-    defer {
-        // cleanup any leftover data in the queue
-        while (audio_batch_queue.get()) |n| {
-            n.data.buf.deinit();
-            gpa.destroy(n);
-        }
-    }
+    defer std.debug.assert(!general_purpose_allocator.deinit());
+
+    defer clearQueue(AudioBatch, &audio_batch_queue);
+    defer clearQueue(*c.AVPacket, &audio_packet_queue);
+    defer clearQueue(*c.AVPacket, &video_packet_queue);
 
     rl.InitWindow(windowWidth, windowHeight, "vid");
     defer rl.CloseWindow();
@@ -315,6 +373,9 @@ pub fn main() !void {
     rl.InitAudioDevice();
     defer rl.CloseAudioDevice();
 
+    c.av_init_packet(&flush_packet);
+    var flush_str = [_]u8{ 'f', 'l', 'u', 's', 'h', 0 };
+    flush_packet.data = &flush_str;
     var format_ctx: ?*c.AVFormatContext = null;
     //_ = try check(c.avformat_open_input(&format_ctx, "/home/nc/Downloads/Mice and cheese - Animation-kMYokm13GyM.mkv", null, null), error.OpeningFile);
     _ = try check(c.avformat_open_input(&format_ctx, "/home/nc/Downloads/5 Minutes of Battlefield 1 Domination Gameplay - 1080p, 60fps-5YdTrNmA7sQ.mkv", null, null), error.OpeningFile);
@@ -433,6 +494,12 @@ pub fn main() !void {
         var out_str = [1]u8{0} ** 64;
         _ = std.fmt.bufPrintZ(out_str[0..], "{d:0.2}", .{getMasterClock()}) catch unreachable;
         rl.DrawText(&out_str, 10, 10, 30, rl.GREEN);
+
+        if (rl.IsMouseButtonReleased(rl.MOUSE_BUTTON_LEFT)) {
+            const p = @intToFloat(f32, rl.GetMouseX()) / @intToFloat(f32, windowWidth);
+            const t = @floatToInt(i64, @intToFloat(f32, format_ctx.?.duration) * p);
+            seek = t;
+        }
 
         rl.EndDrawing();
     }
