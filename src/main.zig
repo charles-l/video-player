@@ -177,7 +177,7 @@ fn videoThread(video_codec_ctx: *c.AVCodecContext) !void {
     );
     defer c.sws_freeContext(sws_ctx);
 
-    while (true) {
+    while (!quit) {
         var qpacket = video_packet_queue.get();
 
         if (qpacket == null) {
@@ -240,7 +240,7 @@ fn audioThread() !void {
 
     _ = try check(c.swr_init(swr_ctx), error.FailedToInit);
 
-    while (true) {
+    while (!quit) {
         var qpacket = audio_packet_queue.get();
         if (qpacket == null) {
             std.time.sleep(1_000_000);
@@ -296,6 +296,7 @@ fn audioThread() !void {
 
 const windowWidth = 800;
 const windowHeight = 600;
+var quit = false;
 
 pub fn main() !void {
     // FIXME: enable again and fix mem leaks
@@ -383,11 +384,11 @@ pub fn main() !void {
 
     var video_thread = try std.Thread.spawn(.{}, videoThread, .{video_codec_ctx});
     try video_thread.setName("video_thread");
-    video_thread.detach();
+    defer video_thread.join();
 
     var audio_thread = try std.Thread.spawn(.{}, audioThread, .{});
     try audio_thread.setName("audio_thread");
-    audio_thread.detach();
+    defer audio_thread.join();
 
     const img = rl.Image{
         .data = null,
@@ -431,4 +432,5 @@ pub fn main() !void {
 
         rl.EndDrawing();
     }
+    quit = true;
 }
