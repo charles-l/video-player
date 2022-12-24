@@ -423,8 +423,12 @@ pub fn main() !void {
             0,
             rl.WHITE,
         );
+
+        const duration = @intToFloat(f64, format_ctx.?.duration) / 1_000_000;
+        const percentWatched = getMasterClock() / duration;
+
         rl.DrawRectangle(4, windowHeight - 24, windowWidth - 8, 20, rl.WHITE);
-        rl.DrawRectangle(8, windowHeight - 20, windowWidth - 16, 12, rl.BLACK);
+        rl.DrawRectangle(8, windowHeight - 20, @floatToInt(i32, (windowWidth - 16) * percentWatched), 12, rl.BLACK);
 
         var out_str = [1]u8{0} ** 64;
         _ = std.fmt.bufPrintZ(out_str[0..], "{d:0.2}", .{getMasterClock()}) catch unreachable;
