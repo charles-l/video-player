@@ -45,6 +45,10 @@ fn decodeFrame(ctx: *c.AVCodecContext, frame: *c.AVFrame) !bool {
     }
 }
 
+fn getMasterClock() f64 {
+    return c.av_q2d(audio_codec_ctx.?.pkt_timebase) * @intToFloat(f64, audio_clock);
+}
+
 export fn audioCallback(buffer: ?*anyopaque, frames: u32) void {
     var buf = @ptrCast([*]i16, @alignCast(@alignOf(i16), buffer))[0 .. frames * 2];
     var frames_filled: usize = 0;
@@ -335,6 +339,8 @@ pub fn main() !void {
     audio_codec_ctx = c.avcodec_alloc_context3(audio_codec);
     _ = try check(c.avcodec_parameters_to_context(audio_codec_ctx, format_ctx.?.streams[audio_stream_i].*.codecpar), error.CodecSetup);
 
+    audio_codec_ctx.?.pkt_timebase = format_ctx.?.streams[audio_stream_i].*.time_base;
+
     defer _ = c.avcodec_close(audio_codec_ctx);
     defer c.avcodec_free_context(&audio_codec_ctx);
 
@@ -396,6 +402,7 @@ pub fn main() !void {
 
     while (!rl.WindowShouldClose()) {
         rl.BeginDrawing();
+        rl.ClearBackground(rl.BLACK);
 
         // check for updated image
         if (frame_lock.tryLock()) {
@@ -415,6 +422,13 @@ pub fn main() !void {
             0,
             rl.WHITE,
         );
+        rl.DrawRectangle(4, windowHeight - 24, windowWidth - 8, 20, rl.WHITE);
+        rl.DrawRectangle(8, windowHeight - 20, windowWidth - 16, 12, rl.BLACK);
+
+        var out_str = [1]u8{0} ** 64;
+        _ = std.fmt.bufPrintZ(out_str[0..], "{d:0.2}", .{getMasterClock()}) catch unreachable;
+        rl.DrawText(&out_str, 10, 10, 30, rl.GREEN);
+
         rl.EndDrawing();
     }
 }
