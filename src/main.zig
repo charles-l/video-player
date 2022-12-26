@@ -127,7 +127,8 @@ fn readThread(ctx: *PlayerContext) !void {
     while (!quit) {
         var packet_i: u32 = 0;
 
-        if (seek) |t| {
+        const t = seek.load(.Unordered);
+        if (t != -1) {
             const seek_target_video = c.av_rescale_q(t, c.AV_TIME_BASE_Q, ctx.format_ctx.streams[ctx.video_stream_i].*.time_base);
             const seek_target_audio = c.av_rescale_q(t, c.AV_TIME_BASE_Q, ctx.format_ctx.streams[ctx.audio_stream_i].*.time_base);
             var flags: i32 = 0;
@@ -157,7 +158,7 @@ fn readThread(ctx: *PlayerContext) !void {
                 qpacket.data = &flush_packet;
                 audio_packet_queue.put(qpacket);
             }
-            seek = null;
+            seek.store(-1, .Unordered);
         }
         // FIXME: this av_read_frame call still seems to be leaking a bit of memory somewhere...
         while (c.av_read_frame(ctx.format_ctx, packet) >= 0) : (packet_i += 1) {
@@ -262,7 +263,7 @@ fn videoThread(video_codec_ctx: *c.AVCodecContext) !void {
                 &frame_rgb.?.*.linesize,
             ), error.FailedToRescale);
 
-            while (audio_clock < frame.*.pts and seek == null) {
+            while (audio_clock < frame.*.pts and seek.load(.Unordered) == -1) {
                 std.atomic.spinLoopHint();
             }
 
@@ -356,8 +357,12 @@ fn audioThread() !void {
 const initWindowWidth = 800;
 const initWindowHeight = 600;
 var quit = false;
+const SeekRequest = extern struct {
+    seek: bool,
+    ts: i64,
+};
 // FIXME: not threadsafe I don't think...
-var seek: ?i64 = null;
+var seek = std.atomic.Atomic(i64).init(-1);
 
 pub fn main() !void {
     defer std.debug.assert(!general_purpose_allocator.deinit());
@@ -501,7 +506,7 @@ pub fn main() !void {
         if (rl.IsMouseButtonReleased(rl.MOUSE_BUTTON_LEFT)) {
             const p = @intToFloat(f32, rl.GetMouseX()) / @intToFloat(f32, windowWidth);
             const t = @floatToInt(i64, @intToFloat(f32, format_ctx.?.duration) * p);
-            seek = t;
+            seek.store(t, .Unordered);
         }
 
         rl.EndDrawing();
