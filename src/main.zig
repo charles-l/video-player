@@ -262,7 +262,7 @@ fn videoThread(video_codec_ctx: *c.AVCodecContext) !void {
                 &frame_rgb.?.*.linesize,
             ), error.FailedToRescale);
 
-            while (audio_clock < frame.*.pts) {
+            while (audio_clock < frame.*.pts and seek == null) {
                 std.atomic.spinLoopHint();
             }
 
@@ -298,7 +298,6 @@ fn audioThread() !void {
         var qpacket = audio_packet_queue.get();
         if (qpacket == null) {
             std.time.sleep(1_000_000);
-            //std.debug.print("audio starved\n", .{});
             continue;
         }
         defer gpa.destroy(qpacket.?);
