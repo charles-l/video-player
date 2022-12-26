@@ -367,6 +367,15 @@ var seek = std.atomic.Atomic(i64).init(-1);
 pub fn main() !void {
     defer std.debug.assert(!general_purpose_allocator.deinit());
 
+    const args = try std.process.argsAlloc(gpa);
+    defer std.process.argsFree(gpa, args);
+
+    if (args.len != 2) {
+        const stdout = std.io.getStdOut().writer();
+        try stdout.print("Usage: {s} FILE\n", .{args[0]});
+        return;
+    }
+
     defer clearQueue(AudioBatch, &audio_batch_queue);
     defer clearQueue(*c.AVPacket, &audio_packet_queue);
     defer clearQueue(*c.AVPacket, &video_packet_queue);
@@ -383,8 +392,7 @@ pub fn main() !void {
     var flush_str = [_]u8{ 'f', 'l', 'u', 's', 'h', 0 };
     flush_packet.data = &flush_str;
     var format_ctx: ?*c.AVFormatContext = null;
-    //_ = try check(c.avformat_open_input(&format_ctx, "/home/nc/Downloads/Mice and cheese - Animation-kMYokm13GyM.mkv", null, null), error.OpeningFile);
-    _ = try check(c.avformat_open_input(&format_ctx, "/home/nc/Downloads/5 Minutes of Battlefield 1 Domination Gameplay - 1080p, 60fps-5YdTrNmA7sQ.mkv", null, null), error.OpeningFile);
+    _ = try check(c.avformat_open_input(&format_ctx, &args[1][0], null, null), error.OpeningFile);
     defer c.avformat_close_input(&format_ctx);
 
     _ = try check(c.avformat_find_stream_info(format_ctx, null), error.FindingStream);
