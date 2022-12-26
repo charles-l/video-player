@@ -353,8 +353,8 @@ fn audioThread() !void {
     }
 }
 
-const windowWidth = 800;
-const windowHeight = 600;
+const initWindowWidth = 800;
+const initWindowHeight = 600;
 var quit = false;
 // FIXME: not threadsafe I don't think...
 var seek: ?i64 = null;
@@ -366,8 +366,10 @@ pub fn main() !void {
     defer clearQueue(*c.AVPacket, &audio_packet_queue);
     defer clearQueue(*c.AVPacket, &video_packet_queue);
 
-    rl.InitWindow(windowWidth, windowHeight, "vid");
+    rl.InitWindow(initWindowWidth, initWindowHeight, "vid");
     defer rl.CloseWindow();
+
+    rl.SetWindowState(rl.FLAG_WINDOW_RESIZABLE);
 
     rl.InitAudioDevice();
     defer rl.CloseAudioDevice();
@@ -474,11 +476,13 @@ pub fn main() !void {
             frame_lock.unlock();
         }
 
-        const targetHeight = (windowWidth / @intToFloat(f32, video_codec_ctx.*.width)) * @intToFloat(f32, video_codec_ctx.*.height);
+        const windowWidth = rl.GetRenderWidth();
+        const windowHeight = rl.GetRenderHeight();
+        const targetHeight = (@intToFloat(f32, windowWidth) / @intToFloat(f32, video_codec_ctx.*.width)) * @intToFloat(f32, video_codec_ctx.*.height);
         rl.DrawTexturePro(
             tex,
             rl.Rectangle{ .x = 0, .y = 0, .width = @intToFloat(f32, video_codec_ctx.*.width), .height = @intToFloat(f32, video_codec_ctx.*.height) },
-            rl.Rectangle{ .x = 0, .y = (windowHeight - targetHeight) / 2, .width = windowWidth, .height = targetHeight },
+            rl.Rectangle{ .x = 0, .y = (@intToFloat(f32, windowHeight) - targetHeight) / 2, .width = @intToFloat(f32, windowWidth), .height = targetHeight },
             rl.Vector2{ .x = 0, .y = 0 },
             0,
             rl.WHITE,
@@ -488,7 +492,7 @@ pub fn main() !void {
         const percentWatched = getMasterClock() / duration;
 
         rl.DrawRectangle(4, windowHeight - 24, windowWidth - 8, 20, rl.WHITE);
-        rl.DrawRectangle(8, windowHeight - 20, @floatToInt(i32, (windowWidth - 16) * percentWatched), 12, rl.BLACK);
+        rl.DrawRectangle(8, windowHeight - 20, @floatToInt(i32, (@intToFloat(f32, windowWidth) - 16) * percentWatched), 12, rl.BLACK);
 
         var out_str = [1]u8{0} ** 64;
         _ = std.fmt.bufPrintZ(out_str[0..], "{d:0.2}", .{getMasterClock()}) catch unreachable;
